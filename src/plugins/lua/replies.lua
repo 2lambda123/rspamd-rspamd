@@ -34,9 +34,14 @@ local settings = {
   expire = 86400, -- 1 day by default
   key_prefix = 'rr',
   key_size = 20,
+  sender_prefix = 'rsrk',
+  sender_key_global = 'verified_senders',
+  sender_key_size = 20,
   message = 'Message is reply to one we originated',
   symbol = 'REPLY',
   score = -4, -- Default score
+  max_local_size = 20,
+  max_global_size = 30,
   use_auth = true,
   use_local = true,
   cookie = nil,
@@ -44,6 +49,10 @@ local settings = {
   cookie_is_pattern = false,
   cookie_valid_time = '2w', -- 2 weeks by default
   min_message_id = 2, -- minimum length of the message-id header
+  reply_sender_privacy = false,
+  reply_sender_privacy_alg = 'blake2',
+  reply_sender_privacy_prefix = 'obf',
+  reply_sender_privacy_length = 16,
 }
 
 local N = "replies"
@@ -51,25 +60,18 @@ local N = "replies"
 local function make_key(goop, sz, prefix)
   local h = hash.create()
   h:update(goop)
-  local key
-  if sz then
-    key = h:base32():sub(1, sz)
-  else
-    key = h:base32()
-  end
-
-  if prefix then
-    key = prefix .. key
-  end
-
+  local key = (prefix or '') .. h:base32():sub(1, sz)
   return key
 end
 
 local function replies_check(task)
   local in_reply_to
+  local global_replies_set_script
+  local local_replies_set_script
+
   local function check_recipient(stored_rcpt)
     local rcpts = task:get_recipients('mime')
-
+    lua_util.debugm(N, task, 'recipients: %s', rcpts)
     if rcpts then
       local filter_predicate = function(input_rcpt)
         local real_rcpt_h = make_key(input_rcpt:lower(), 8)
@@ -81,7 +83,12 @@ local function replies_check(task)
         return rcpt.addr or ''
       end, rcpts)) then
         lua_util.debugm(N, task, 'reply to %s validated', in_reply_to)
-        return true
+
+        --storing only addr of rcpt
+        for i = 1, #rcpts do
+          rcpts[i] = rcpts[i].addr
+        end
+        return rcpts
       end
 
       rspamd_logger.infox(task, 'ignoring reply to %s as no recipients are matching hash %s',
@@ -91,7 +98,135 @@ local function replies_check(task)
           in_reply_to, stored_rcpt)
     end
 
-    return false
+    return nil
+  end
+
+  local function configure_redis_scripts()
+    local redis_script_zadd_global = [[
+      local global_size = redis.call('ZCARD', KEYS[1])
+      if global_size > {= mgs =} then
+        redis.call('ZREMRANGEBYRANK', KEYS[1], '{= mgs =}', global_size)
+      end
+      -- adding recipients to the global replies set
+      redis.call('ZADD', KEYS[1], ARGV[1], ARGV[2])
+      ]]
+    local set_script_zadd_global = lua_util.jinja_template(redis_script_zadd_global,
+              { mgs = settings['max_global_size'] })
+    global_replies_set_script =  lua_redis.add_redis_script(set_script_zadd_global, redis_params)
+
+    local redis_script_zadd_local = [[
+      local local_replies_set_size = redis.call('ZCARD', KEYS[1])
+      if local_replies_set_size > {= mls =} then
+        redis.call('ZREMRANGEBYRANK', KEYS[1], '{= mls =}', local_replies_set_size)
+      end
+      -- adding recipients for the local replies set
+      redis.call('ZADD', KEYS[1], ARGV[1], ARGV[2])
+      -- setting expire for local replies set
+      redis.call('EXPIRE', KEYS[1], tostring(math.floor('{= exp =}')))
+    ]]
+    local set_script_zadd_local = lua_util.jinja_template(redis_script_zadd_local,
+      { exp = settings['expire'], mls = settings['max_local_size'] })
+    local_replies_set_script = lua_redis.add_redis_script(set_script_zadd_local, redis_params)
+  end
+
+  local function add_to_global_replies_set(recipients, global_key, task_time)
+    lua_util.debugm(N, task, 'Adding recipients %s to global replies set', recipients)
+
+    local function zadd_global_set_cb(err, data)
+      if err ~= nil then
+        rspamd_logger.errx(task, 'failed to add recipients %s to global replies set with error: %s', recipients, err)
+        return
+      end
+      rspamd_logger.infox(task, 'added recipients %s to global set', recipients)
+    end
+    for _, rcpt in ipairs(recipients) do
+      lua_redis.exec_redis_script(global_replies_set_script,
+              { task=task, is_write = true },
+              zadd_global_set_cb,
+              { global_key },
+              { task_time, rcpt })
+    end
+  end
+
+  local function update_global_replies_set(recipients, sender_key, global_key, task_time)
+    local function redis_zrange_cb(err, data)
+      if err ~= nil then
+        rspamd_logger.errx(task,
+                'redis_zrange_cb error when reading zrange withscores from global replies set with error: %s', err)
+        return
+      end
+      local last_score = tonumber(data[#data])
+      lua_util.debugm(N, task, 'last score %s of global replies set was received', last_score)
+
+      -- if last score wasn't found
+      if last_score == nil then
+        lua_util.debugm(N, task,
+                'have not found any senders in global replies set, considering last score as 0')
+        last_score = 0
+      end
+
+      -- updating params considering last score of existing sender
+      task_time = task_time + last_score
+
+      add_to_global_replies_set(recipients, global_key, tostring(task_time))
+    end
+
+    lua_util.debugm(N, task, 'Getting recipients withscores from global replies set to get last score')
+
+    -- getting scores of recipients in global replies set
+    lua_redis.redis_make_request(task,
+            redis_params,
+            sender_key,
+            false,
+            redis_zrange_cb,
+            'ZRANGE',
+            {global_key, '-1', '-1', 'WITHSCORES'}
+    )
+  end
+
+  local function add_to_replies_set(recipients)
+    local sender = task:get_reply_sender()
+
+    local task_time = task:get_timeval(true)
+
+    -- making params out of recipients list for replies set
+    local task_time_str = tostring(task_time)
+
+    local sender_string = lua_util.maybe_obfuscate_string(tostring(sender), settings, settings.sender_prefix)
+    local sender_key = make_key(sender_string:lower(), 8)
+
+    lua_util.debugm(N, task,
+            'Adding recipients %s to sender %s local replies set', recipients, sender_key)
+
+    local global_key = make_key(settings.sender_key_global, settings.sender_key_size, settings.sender_prefix)
+
+    configure_redis_scripts()
+
+    local function zadd_cb(err, data)
+      if err ~= nil then
+        rspamd_logger.errx(task, 'adding to %s failed with error: %s', sender_key, err)
+        return
+      end
+
+      lua_util.debugm(N, task, 'added data: %s to sender: %s', recipients, sender_key)
+
+      update_global_replies_set(recipients, sender_key, global_key, task_time)
+    end
+    for i = 1, #recipients do
+      if i ~= #recipients then
+        lua_redis.exec_redis_script(local_replies_set_script,
+                {task = task, is_write = true},
+                nil,
+                { sender_key },
+                { task_time_str, recipients[i] })
+      else
+        lua_redis.exec_redis_script(local_replies_set_script,
+                {task = task, is_write = true},
+                zadd_cb,
+                { sender_key },
+                { task_time_str, recipients[i] })
+      end
+    end
   end
 
   local function redis_get_cb(err, data, addr)
@@ -99,8 +234,10 @@ local function replies_check(task)
       rspamd_logger.errx(task, 'redis_get_cb error when reading data from %s: %s', addr:get_addr(), err)
       return
     end
-    if data and type(data) == 'string' and check_recipient(data) then
+    local recipients = check_recipient(data)
+    if type(data) == 'string' and recipients then
       -- Hash was found
+      add_to_replies_set(recipients)
       task:insert_result(settings['symbol'], 1.0)
       if settings['action'] ~= nil then
         local ip_addr = task:get_ip()
@@ -134,6 +271,8 @@ local function replies_check(task)
   if not ret then
     rspamd_logger.errx(task, "redis request wasn't scheduled")
   end
+
+
 end
 
 local function replies_set(task)
@@ -225,7 +364,6 @@ local function replies_check_cookie(task)
   if irt == nil then
     return
   end
-
   local cr = require "rspamd_cryptobox"
   -- Extract user part if needed
   local extracted_cookie = irt:match('^%<?([^@]+)@.*$')
@@ -284,6 +422,9 @@ if opts then
       if settings.cookie_valid_time then
         settings.cookie_valid_time = lua_util.parse_time_interval(settings.cookie_valid_time)
       end
+
+      lua_redis.register_prefix(settings.sender_prefix, N,
+              'Prefix to identify replies sets')
 
       local id = rspamd_config:register_symbol({
         name = 'REPLIES_CHECK',
